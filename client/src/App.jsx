@@ -2,60 +2,62 @@ import React, { useEffect, useState } from 'react';
 import axios from 'axios';
 import HashRing from './components/HashRing';
 import LogPanel from './components/LogPanel';
-
-const API = 'http://localhost:5000/api/ring';
-
+const API = import.meta.env.VITE_API_URL ?? 'http://localhost:5000/api/ring';
 function App() {
-  const [nodes, setNodes] = useState([]);
-  const [dataKeys, setDataKeys] = useState([]);
-  const [nodeName, setNodeName] = useState('');
-  const [keyName, setKeyName] = useState('');
-  const [logs, setLogs] = useState([]);
-
-  const logEvent = (msg) => {
-    setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
-  };
-
-  const fetchState = async () => {
-    const res = await axios.get(`${API}/state`);
-    setNodes(res.data.nodes);
-    setDataKeys(res.data.dataKeys);
-  };
-
-  useEffect(() => {
-    fetchState();
-  }, []);
-
-  const addNode = async () => {
-    if (!nodeName.trim()) return;
-    await axios.post(`${API}/add-node`, { name: nodeName });
-    logEvent(`Node "${nodeName}" added`);
-    fetchState();
-    setNodeName('');
-  };
-
-  const removeNode = async () => {
-    if (!nodeName.trim()) return;
-    await axios.post(`${API}/remove-node`, { name: nodeName });
-    logEvent(`Node "${nodeName}" removed`);
-    fetchState();
-    setNodeName('');
-  };
-
-  const addKey = async () => {
-    if (!keyName.trim()) return;
-    await axios.post(`${API}/add-key`, { key: keyName });
-    logEvent(`Key "${keyName}" added`);
-    fetchState();
-    setKeyName('');
-  };
-
-  const reset = async () => {
-    await axios.post(`${API}/reset`);
-    logEvent(`System reset`);
-    fetchState();
-  };
-
+ const [nodes, setNodes] = useState([]);
+ const [dataKeys, setDataKeys] = useState([]);
+ const [nodeName, setNodeName] = useState('');
+ const [keyName, setKeyName] = useState('');
+ const [logs, setLogs] = useState([]);
+ const [busy, setBusy] = useState(false);
+ const [error, setError] = useState('');
+ const logEvent = (msg) =>
+ setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
+ // One wrapper for every request: loading flag, error handling, state from the response
+ const call = async (request, okMsg) => {
+ setBusy(true);
+ setError('');
+ try {
+const { data } = await request();
+ setNodes(data.nodes);
+ setDataKeys(data.dataKeys);
+ if (okMsg) logEvent(okMsg(data));
+ return true;
+ } catch (e) {
+ const msg = e.response?.data?.error ?? 'Server unreachable (it may be waking up - retry in ~30s)';
+ setError(msg);
+ logEvent(`Error: ${msg}`);
+ return false;
+ } finally {
+ setBusy(false);
+ }
+ };
+ useEffect(() => {
+ axios.get(`${API}/state`)
+ .then(({ data }) => { setNodes(data.nodes); setDataKeys(data.dataKeys); })
+ .catch(() => setError('Server unreachable (it may be waking up - retry in ~30s)'));
+ }, []);
+ const addNode = async () => {
+ const name = nodeName.trim();
+ if (!name) return;
+ const ok = await call(() => axios.post(`${API}/add-node`, { name }),
+ (d) => `Node "${name}" added - ${d.moved} key(s) moved`);
+ if (ok) setNodeName('');
+ };
+ const removeNode = async () => {
+ const name = nodeName.trim();
+ if (!name) return;
+ const ok = await call(() => axios.post(`${API}/remove-node`, { name }),
+ (d) => `Node "${name}" removed - ${d.moved} key(s) moved`);
+ if (ok) setNodeName('');
+ };
+ const addKey = async () => {
+ const key = keyName.trim();
+ if (!key) return;
+ const ok = await call(() => axios.post(`${API}/add-key`, { key }), () => `Key "${key}" added`);
+ if (ok) setKeyName('');
+ };
+ const reset = () => call(() => axios.post(`${API}/reset`), () => 'System reset');  
   // Group keys by assigned node
   const keysByNode = {};
   nodes.forEach(node => {
@@ -79,6 +81,7 @@ function App() {
             load balancers, and DHTs (like Amazon Dynamo or Apache Cassandra).
           </p>
         </div> */}
+        {error && <div className="mb-4 text-center text-red-600">{error}</div>}
         <h1 className="text-5xl mb-8 font-extrabold text-center text-black drop-shadow-lg">Consistent Hashing Visualizer</h1>
         <div className="flex flex-wrap gap-4 mb-10 justify-center">
           <input
@@ -90,12 +93,14 @@ function App() {
           <button
             onClick={addNode}
             className="bg-blue-500 hover:bg-blue-600 p-3 rounded-lg font-semibold text-white transition"
+             disabled={busy}
           >
             Add Node
           </button>
           <button
             onClick={removeNode}
             className="bg-red-500 hover:bg-red-600 p-3 rounded-lg font-semibold text-white transition"
+             disabled={busy}
           >
             Remove Node
           </button>
@@ -108,12 +113,14 @@ function App() {
           <button
             onClick={addKey}
             className="bg-blue-500 hover:bg-blue-600 p-3 rounded-lg font-semibold text-white transition"
+             disabled={busy}
           >
             Add Key
           </button>
           <button
             onClick={reset}
             className="bg-gray-200 hover:bg-gray-300 p-3 rounded-lg font-semibold text-black transition"
+             disabled={busy}
           >
             Reset
           </button>

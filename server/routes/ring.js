@@ -1,66 +1,143 @@
+// const express = require('express');
+// const router = express.Router();
+
+// let ring = {}; // { hash: nodeId }
+// let nodes = []; // [{ id, name, hash }]
+// let dataKeys = []; // [{ key, hash, assignedNode }]
+
+// const hashFn = (str) =>
+//   parseInt(
+//     require('crypto').createHash('md5').update(str).digest('hex').slice(0, 8),
+//     16
+//   );
+
+// function redistribute() {
+//   if (nodes.length === 0) {
+//     dataKeys.forEach(d => d.assignedNode = null);
+//     return;
+//   }
+//   // Sort nodes by hash
+//   const sortedNodes = [...nodes].sort((a, b) => a.hash - b.hash);
+//   dataKeys.forEach((d) => {
+//     // Find the first node with hash >= key's hash
+//     let assigned = sortedNodes.find(n => n.hash >= d.hash);
+//     // If not found, wrap around to the first node (smallest hash)
+//     if (!assigned) assigned = sortedNodes[0];
+//     d.assignedNode = assigned;
+//   });
+// }
+
+// router.get('/state', (req, res) => {
+//   res.json({ nodes, dataKeys });
+// });
+
+// router.post('/add-node', (req, res) => {
+//   const { name } = req.body;
+//   const hash = hashFn(name);
+//   const node = { id: Date.now(), name, hash };
+//   nodes.push(node);
+//   redistribute();
+//   res.json({ nodes, dataKeys });
+// });
+
+// router.post('/remove-node', (req, res) => {
+//   const { name } = req.body;
+//   const hash = hashFn(name);
+//   nodes = nodes.filter((n) => n.hash !== hash);
+//   redistribute();
+//   res.json({ nodes, dataKeys });
+// });
+
+// router.post('/add-key', (req, res) => {
+//   const { key } = req.body;
+//   const hash = hashFn(key);
+//   dataKeys.push({ key, hash, assignedNode: null });
+//   redistribute();
+//   res.json({ nodes, dataKeys });
+// });
+
+// router.post('/reset', (req, res) => {
+//   nodes = [];
+//   dataKeys = [];
+//   ring = {};
+//   res.json({ nodes, dataKeys });
+// });
+
+// module.exports = router;
+
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
-
-let ring = {}; // { hash: nodeId }
-let nodes = []; // [{ id, name, hash }]
-let dataKeys = []; // [{ key, hash, assignedNode }]
-
-const hashFn = (str) =>
-  parseInt(
-    require('crypto').createHash('md5').update(str).digest('hex').slice(0, 8),
-    16
-  );
-
-function redistribute() {
-  if (nodes.length === 0) {
-    dataKeys.forEach(d => d.assignedNode = null);
-    return;
-  }
-  // Sort nodes by hash
-  const sortedNodes = [...nodes].sort((a, b) => a.hash - b.hash);
-  dataKeys.forEach((d) => {
-    // Find the first node with hash >= key's hash
-    let assigned = sortedNodes.find(n => n.hash >= d.hash);
-    // If not found, wrap around to the first node (smallest hash)
-    if (!assigned) assigned = sortedNodes[0];
-    d.assignedNode = assigned;
-  });
+const VNODES = Number(process.env.VNODES) || 50; // virtual nodes per physical node
+const MAX_KEYS = 500; // basic abuse protection
+const hashFn = (s) =>
+ parseInt(crypto.createHash('md5').update(s).digest('hex').slice(0, 8), 16);
+const nodes = new Map(); // name -> { name, hash, points: [vnode hashes] }
+const dataKeys = new Map(); // key -> { key, hash, assignedNode }
+let ring = []; // [{ hash, node }] sorted by hash (all virtual nodes)
+const clean = (v) =>
+ typeof v === 'string' && v.trim() && v.trim().length <= 64 ? v.trim() : null;
+function rebuildRing() {
+ ring = [];
+ for (const n of nodes.values()) {
+ n.points = [];
+ for (let i = 0; i < VNODES; i++) {
+ const h = hashFn(`${n.name}#${i}`);
+ n.points.push(h);
+ ring.push({ hash: h, node: n.name });
+ }
+ }
+ ring.sort((a, b) => a.hash - b.hash);
 }
-
-router.get('/state', (req, res) => {
-  res.json({ nodes, dataKeys });
-});
-
+// Binary search: first ring point with hash >= h, wrapping to index 0
+function lookup(h) {
+ let lo = 0, hi = ring.length;
+ while (lo < hi) {
+ const mid = (lo + hi) >> 1;
+ if (ring[mid].hash >= h) hi = mid; else lo = mid + 1;
+ }
+ return ring[lo % ring.length].node;
+}
+// Re-assign every key; return how many keys CHANGED owner (the whole point!)
+function redistribute() {
+ let moved = 0;
+ for (const d of dataKeys.values()) {
+ const next = ring.length ? nodes.get(lookup(d.hash)) : null;
+ const prevName = d.assignedNode ? d.assignedNode.name : null;
+ if (prevName !== null && (next ? next.name : null) !== prevName) moved++;
+ d.assignedNode = next;
+ }
+ return moved;
+}
+const snapshot = (extra = {}) =>
+ ({ nodes: [...nodes.values()], dataKeys: [...dataKeys.values()], ...extra });
+router.get('/state', (req, res) => res.json(snapshot()));
 router.post('/add-node', (req, res) => {
-  const { name } = req.body;
-  const hash = hashFn(name);
-  const node = { id: Date.now(), name, hash };
-  nodes.push(node);
-  redistribute();
-  res.json({ nodes, dataKeys });
+ const name = clean(req.body?.name);
+ if (!name) return res.status(400).json({ error: 'name must be a non-empty string (max 64 chars)' });
+ if (nodes.has(name)) return res.status(409).json({ error: `node "${name}" already exists` });
+ nodes.set(name, { name, hash: hashFn(name), points: [] });
+ rebuildRing();
+ res.status(201).json(snapshot({ moved: redistribute() }));
 });
-
 router.post('/remove-node', (req, res) => {
-  const { name } = req.body;
-  const hash = hashFn(name);
-  nodes = nodes.filter((n) => n.hash !== hash);
-  redistribute();
-  res.json({ nodes, dataKeys });
+ const name = clean(req.body?.name);
+ if (!name) return res.status(400).json({ error: 'name must be a non-empty string (max 64 chars)' });
+ if (!nodes.delete(name)) return res.status(404).json({ error: `node "${name}" not found` });
+ rebuildRing();
+ res.json(snapshot({ moved: redistribute() }));
 });
-
 router.post('/add-key', (req, res) => {
-  const { key } = req.body;
-  const hash = hashFn(key);
-  dataKeys.push({ key, hash, assignedNode: null });
-  redistribute();
-  res.json({ nodes, dataKeys });
+ const key = clean(req.body?.key);
+ if (!key) return res.status(400).json({ error: 'key must be a non-empty string (max 64 chars)' });
+ if (dataKeys.has(key)) return res.status(409).json({ error: `key "${key}" already exists` });
+ if (dataKeys.size >= MAX_KEYS) return res.status(429).json({ error: `limit of ${MAX_KEYS} keys reached` });
+ dataKeys.set(key, { key, hash: hashFn(key), assignedNode: null });
+ redistribute();
+ res.status(201).json(snapshot());
 });
-
 router.post('/reset', (req, res) => {
-  nodes = [];
-  dataKeys = [];
-  ring = {};
-  res.json({ nodes, dataKeys });
+ nodes.clear(); dataKeys.clear(); ring = [];
+ res.json(snapshot());
 });
-
 module.exports = router;
